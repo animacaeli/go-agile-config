@@ -1,0 +1,135 @@
+package agileconfig
+
+import (
+	"context"
+	"encoding/json"
+	"fmt"
+	"net/http"
+	"strings"
+	"sync"
+	"time"
+
+	"github.com/gorilla/websocket"
+)
+
+// websocketAction mirrors the AgileConfig WebsocketAction protocol message.
+// Fields use PascalCase JSON tags to match the server's Newtonsoft.Json serialization.
+type websocketAction struct {
+	Module string `json:"Module"`
+	Action string `json:"Action"`
+	Data   string `json:"Data"`
+}
+
+// wsClient manages a WebSocket connection to the AgileConfig server.
+type wsClient struct {
+	url      string
+	appID    string
+	secret   string
+	env      string
+	timeout  time.Duration
+	onAction func(action websocketAction)
+
+	mu     sync.Mutex
+	conn   *websocket.Conn
+	closed bool
+}
+
+func newWSClient(url, appID, secret, env string, timeout time.Duration, onAction func(websocketAction)) *wsClient {
+	return &wsClient{
+		url:      url,
+		appID:    appID,
+		secret:   secret,
+		env:      env,
+		timeout:  timeout,
+		onAction: onAction,
+	}
+}
+
+func (w *wsClient) connect(ctx context.Context) error {
+	header := http.Header{}
+	header.Set("Authorization", "Basic "+basicAuth(w.appID, w.secret))
+	header.Set("appid", w.appID)
+	header.Set("env", w.env)
+	header.Set("client-v", "1.8.0")
+
+	dialer := websocket.Dialer{HandshakeTimeout: w.timeout}
+	conn, _, err := dialer.DialContext(ctx, w.url, header)
+	if err != nil {
+		return fmt.Errorf("websocket dial: %w", err)
+	}
+
+	w.mu.Lock()
+	w.conn = conn
+	w.closed = false
+	w.mu.Unlock()
+
+	go w.readLoop()
+
+	return nil
+}
+
+func (w *wsClient) readLoop() {
+	defer w.clearConn()
+
+	for {
+		w.mu.Lock()
+		conn := w.conn
+		w.mu.Unlock()
+
+		if conn == nil {
+			return
+		}
+
+		_, message, err := conn.ReadMessage()
+		if err != nil {
+			return
+		}
+
+		var action websocketAction
+		if err := json.Unmarshal(message, &action); err != nil {
+			continue
+		}
+
+		if w.onAction != nil {
+			w.onAction(action)
+		}
+	}
+}
+
+func (w *wsClient) send(msg string) error {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if w.conn == nil || w.closed {
+		return fmt.Errorf("websocket not connected")
+	}
+	return w.conn.WriteMessage(websocket.TextMessage, []byte(msg))
+}
+
+func (w *wsClient) close() {
+	w.mu.Lock()
+	w.closed = true
+	conn := w.conn
+	w.mu.Unlock()
+
+	if conn != nil {
+		conn.Close()
+	}
+}
+
+func (w *wsClient) clearConn() {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if w.conn != nil {
+		w.conn.Close()
+		w.conn = nil
+	}
+}
+
+// buildWSURL converts an HTTP(S) server URL to a WS(S) URL for the AgileConfig WebSocket endpoint.
+func buildWSURL(serverURL string) string {
+	u := strings.TrimRight(serverURL, "/")
+	if strings.HasPrefix(u, "https://") {
+		return "wss" + strings.TrimPrefix(u, "https") + "/ws"
+	}
+	return "ws" + strings.TrimPrefix(u, "http") + "/ws"
+}
