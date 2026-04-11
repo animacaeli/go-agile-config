@@ -217,9 +217,20 @@ func TestWSURL(t *testing.T) {
 		{"https://example.com/", "wss://example.com/ws"},
 	}
 	for _, tt := range tests {
-		got := buildWSURL(tt.input)
+		got, err := buildWSURL(tt.input)
+		if err != nil {
+			t.Errorf("buildWSURL(%q) unexpected error: %v", tt.input, err)
+			continue
+		}
 		if got != tt.expected {
 			t.Errorf("buildWSURL(%q) = %q, want %q", tt.input, got, tt.expected)
 		}
+	}
+}
+
+func TestWSURL_InvalidInput(t *testing.T) {
+	_, err := buildWSURL("localhost:5000")
+	if err == nil {
+		t.Fatal("expected error for invalid URL")
 	}
 }

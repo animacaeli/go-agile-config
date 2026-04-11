@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"log"
 	"math"
+	"sync"
 	"time"
 )
 
@@ -13,13 +14,16 @@ import (
 type Client struct {
 	tp    *transport
 	store *configStore
-	ws    *wsClient
 	opts  options
 
 	ctx    context.Context
 	cancel context.CancelFunc
 
-	pingTicker *time.Ticker
+	ws           *wsClient
+	wsMu         sync.Mutex
+	pingTicker   *time.Ticker
+	reconnMu     sync.Mutex
+	reconnecting bool
 }
 
 // NewClient creates a new AgileConfig client.
@@ -55,12 +59,18 @@ func (c *Client) Start(ctx context.Context) error {
 
 // Stop gracefully shuts down the client, closing the WebSocket connection.
 func (c *Client) Stop() {
+	// Acquire reconnMu to synchronize with any in-flight reconnect goroutine.
+	c.reconnMu.Lock()
 	if c.cancel != nil {
 		c.cancel()
 	}
+	c.wsMu.Lock()
 	if c.ws != nil {
 		c.ws.close()
 	}
+	c.wsMu.Unlock()
+	c.reconnMu.Unlock()
+
 	if c.pingTicker != nil {
 		c.pingTicker.Stop()
 	}
@@ -111,29 +121,39 @@ func (c *Client) loadConfigs(ctx context.Context) error {
 	return nil
 }
 
+// wsActionHandler returns a shared WebSocket action callback.
+func (c *Client) wsActionHandler() func(websocketAction) {
+	return func(action websocketAction) {
+		switch action.Action {
+		case "reload":
+			if err := c.loadConfigs(c.ctx); err != nil {
+				log.Printf("agileconfig: reload failed: %v", err)
+			}
+		case "offline":
+			go c.tryReconnect()
+		case "ping":
+			// Heartbeat response, no action needed
+		}
+	}
+}
+
 // startWebSocket establishes a WebSocket connection in a background goroutine.
 func (c *Client) startWebSocket() {
-	url := buildWSURL(c.tp.serverURL)
+	url, err := buildWSURL(c.tp.getServerURL())
+	if err != nil {
+		log.Printf("agileconfig: %v", err)
+		return
+	}
 
-	c.ws = newWSClient(url, c.tp.appID, c.tp.secret, c.opts.env, c.opts.httpTimeout,
-		func(action websocketAction) {
-			switch action.Action {
-			case "reload":
-				if err := c.loadConfigs(c.ctx); err != nil {
-					log.Printf("agileconfig: reload failed: %v", err)
-				}
-			case "offline":
-				go c.reconnect()
-			case "ping":
-				// Heartbeat response, no action needed
-			}
-		},
+	ws := newWSClient(url, c.tp.getAppID(), c.tp.getSecret(), c.opts.env, c.opts.httpTimeout,
+		c.wsActionHandler(),
 	)
+	c.setWS(ws)
 
 	go func() {
-		if err := c.ws.connect(c.ctx); err != nil {
+		if err := ws.connect(c.ctx); err != nil {
 			log.Printf("agileconfig: websocket connect failed: %v", err)
-			go c.reconnect()
+			go c.tryReconnect()
 			return
 		}
 		c.startPing()
@@ -148,13 +168,46 @@ func (c *Client) startPing() {
 	for {
 		select {
 		case <-c.pingTicker.C:
-			if err := c.ws.send("c:ping"); err != nil {
-				return
+			if ws := c.getWS(); ws != nil {
+				if err := ws.send("c:ping"); err != nil {
+					return
+				}
 			}
 		case <-c.ctx.Done():
 			return
 		}
 	}
+}
+
+func (c *Client) setWS(ws *wsClient) {
+	c.wsMu.Lock()
+	c.ws = ws
+	c.wsMu.Unlock()
+}
+
+func (c *Client) getWS() *wsClient {
+	c.wsMu.Lock()
+	defer c.wsMu.Unlock()
+	return c.ws
+}
+
+// tryReconnect guards reconnect with a mutex to prevent concurrent reconnection attempts.
+func (c *Client) tryReconnect() {
+	c.reconnMu.Lock()
+	if c.reconnecting {
+		c.reconnMu.Unlock()
+		return
+	}
+	c.reconnecting = true
+	c.reconnMu.Unlock()
+
+	defer func() {
+		c.reconnMu.Lock()
+		c.reconnecting = false
+		c.reconnMu.Unlock()
+	}()
+
+	c.reconnect()
 }
 
 // reconnect attempts to re-establish the WebSocket connection with exponential backoff.
@@ -169,25 +222,21 @@ func (c *Client) reconnect() {
 		case <-time.After(backoff):
 		}
 
-		if c.ws != nil {
-			c.ws.close()
+		if ws := c.getWS(); ws != nil {
+			ws.close()
 		}
 
-		url := buildWSURL(c.tp.serverURL)
-		c.ws = newWSClient(url, c.tp.appID, c.tp.secret, c.opts.env, c.opts.httpTimeout,
-			func(action websocketAction) {
-				switch action.Action {
-				case "reload":
-					if err := c.loadConfigs(c.ctx); err != nil {
-						log.Printf("agileconfig: reload failed: %v", err)
-					}
-				case "offline":
-					go c.reconnect()
-				}
-			},
+		url, err := buildWSURL(c.tp.getServerURL())
+		if err != nil {
+			log.Printf("agileconfig: %v", err)
+			return
+		}
+		ws := newWSClient(url, c.tp.getAppID(), c.tp.getSecret(), c.opts.env, c.opts.httpTimeout,
+			c.wsActionHandler(),
 		)
+		c.setWS(ws)
 
-		if err := c.ws.connect(c.ctx); err != nil {
+		if err := ws.connect(c.ctx); err != nil {
 			log.Printf("agileconfig: reconnect failed: %v", err)
 			backoff = time.Duration(math.Min(float64(backoff*2), float64(maxInterval)))
 			continue

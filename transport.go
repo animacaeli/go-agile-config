@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"time"
 )
 
@@ -40,13 +41,17 @@ func newTransport(serverURL, appID, secret string, timeout time.Duration) *trans
 	}
 }
 
+func (t *transport) getServerURL() string { return t.serverURL }
+func (t *transport) getAppID() string     { return t.appID }
+func (t *transport) getSecret() string    { return t.secret }
+
 func (t *transport) fetchConfigs(ctx context.Context, env string) ([]apiConfig, string, error) {
-	url := fmt.Sprintf("%s/api/Config/app/%s", t.serverURL, t.appID)
+	u := fmt.Sprintf("%s/api/Config/app/%s", t.serverURL, url.PathEscape(t.appID))
 	if env != "" {
-		url += "?env=" + env
+		u += "?env=" + url.QueryEscape(env)
 	}
 
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u, nil)
 	if err != nil {
 		return nil, "", fmt.Errorf("creating request: %w", err)
 	}

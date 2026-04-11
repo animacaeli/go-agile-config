@@ -4,9 +4,9 @@ import (
 	"testing"
 )
 
-func TestConfigStore_SetAndGet(t *testing.T) {
+func TestConfigStore_GetAfterReload(t *testing.T) {
 	s := newConfigStore()
-	s.set("db.host", "localhost")
+	s.reload(map[string]string{"db.host": "localhost"})
 
 	val, ok := s.get("db.host")
 	if !ok {
@@ -27,7 +27,7 @@ func TestConfigStore_GetMissing(t *testing.T) {
 
 func TestConfigStore_GetByGroup(t *testing.T) {
 	s := newConfigStore()
-	s.set("database:host", "127.0.0.1")
+	s.reload(map[string]string{"database:host": "127.0.0.1"})
 
 	val, ok := s.getByGroup("database", "host")
 	if !ok {
@@ -48,8 +48,7 @@ func TestConfigStore_GetByGroup_Missing(t *testing.T) {
 
 func TestConfigStore_GetAll(t *testing.T) {
 	s := newConfigStore()
-	s.set("a", "1")
-	s.set("b", "2")
+	s.reload(map[string]string{"a": "1", "b": "2"})
 
 	all := s.getAll()
 	if len(all) != 2 {
@@ -62,7 +61,7 @@ func TestConfigStore_GetAll(t *testing.T) {
 
 func TestConfigStore_GetAll_ReturnsCopy(t *testing.T) {
 	s := newConfigStore()
-	s.set("a", "1")
+	s.reload(map[string]string{"a": "1"})
 
 	all := s.getAll()
 	all["a"] = "mutated"
@@ -75,8 +74,7 @@ func TestConfigStore_GetAll_ReturnsCopy(t *testing.T) {
 
 func TestConfigStore_Reload_DetectsChanges(t *testing.T) {
 	s := newConfigStore()
-	s.set("a", "1")
-	s.set("b", "2")
+	s.reload(map[string]string{"a": "1", "b": "2"})
 
 	newData := map[string]string{
 		"a": "1",
@@ -106,7 +104,7 @@ func TestConfigStore_Reload_DetectsChanges(t *testing.T) {
 
 func TestConfigStore_Reload_NoChanges(t *testing.T) {
 	s := newConfigStore()
-	s.set("a", "1")
+	s.reload(map[string]string{"a": "1"})
 
 	newData := map[string]string{"a": "1"}
 	changed := s.reload(newData)
@@ -118,8 +116,7 @@ func TestConfigStore_Reload_NoChanges(t *testing.T) {
 
 func TestConfigStore_Reload_ReplacesAll(t *testing.T) {
 	s := newConfigStore()
-	s.set("a", "1")
-	s.set("b", "2")
+	s.reload(map[string]string{"a": "1", "b": "2"})
 
 	newData := map[string]string{"c": "3"}
 	s.reload(newData)

@@ -43,12 +43,6 @@ func (s *configStore) getAll() map[string]string {
 	return cp
 }
 
-func (s *configStore) set(key, value string) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	s.data[key] = value
-}
-
 // reload replaces all stored data with newData and returns the list of keys
 // whose values changed (added, removed, or modified).
 func (s *configStore) reload(newData map[string]string) []string {

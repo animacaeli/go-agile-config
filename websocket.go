@@ -71,15 +71,15 @@ func (w *wsClient) connect(ctx context.Context) error {
 func (w *wsClient) readLoop() {
 	defer w.clearConn()
 
+	w.mu.Lock()
+	conn := w.conn
+	w.mu.Unlock()
+
+	if conn == nil {
+		return
+	}
+
 	for {
-		w.mu.Lock()
-		conn := w.conn
-		w.mu.Unlock()
-
-		if conn == nil {
-			return
-		}
-
 		_, message, err := conn.ReadMessage()
 		if err != nil {
 			return
@@ -107,12 +107,11 @@ func (w *wsClient) send(msg string) error {
 
 func (w *wsClient) close() {
 	w.mu.Lock()
+	defer w.mu.Unlock()
 	w.closed = true
-	conn := w.conn
-	w.mu.Unlock()
-
-	if conn != nil {
-		conn.Close()
+	if w.conn != nil {
+		w.conn.Close()
+		w.conn = nil
 	}
 }
 
@@ -126,10 +125,13 @@ func (w *wsClient) clearConn() {
 }
 
 // buildWSURL converts an HTTP(S) server URL to a WS(S) URL for the AgileConfig WebSocket endpoint.
-func buildWSURL(serverURL string) string {
+func buildWSURL(serverURL string) (string, error) {
 	u := strings.TrimRight(serverURL, "/")
 	if strings.HasPrefix(u, "https://") {
-		return "wss" + strings.TrimPrefix(u, "https") + "/ws"
+		return "wss" + strings.TrimPrefix(u, "https") + "/ws", nil
 	}
-	return "ws" + strings.TrimPrefix(u, "http") + "/ws"
+	if strings.HasPrefix(u, "http://") {
+		return "ws" + strings.TrimPrefix(u, "http") + "/ws", nil
+	}
+	return "", fmt.Errorf("invalid server URL %q: must start with http:// or https://", serverURL)
 }
