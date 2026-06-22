@@ -28,13 +28,19 @@ type wsClient struct {
 	env      string
 	timeout  time.Duration
 	onAction func(action websocketAction)
+	onClose  func(ws *wsClient)
 
 	mu     sync.Mutex
 	conn   *websocket.Conn
 	closed bool
 }
 
-func newWSClient(url, appID, secret, env string, timeout time.Duration, onAction func(websocketAction)) *wsClient {
+func newWSClient(
+	url, appID, secret, env string,
+	timeout time.Duration,
+	onAction func(websocketAction),
+	onClose func(*wsClient),
+) *wsClient {
 	return &wsClient{
 		url:      url,
 		appID:    appID,
@@ -42,6 +48,7 @@ func newWSClient(url, appID, secret, env string, timeout time.Duration, onAction
 		env:      env,
 		timeout:  timeout,
 		onAction: onAction,
+		onClose:  onClose,
 	}
 }
 
@@ -69,7 +76,12 @@ func (w *wsClient) connect(ctx context.Context) error {
 }
 
 func (w *wsClient) readLoop() {
-	defer w.clearConn()
+	defer func() {
+		closed := w.clearConn()
+		if !closed && w.onClose != nil {
+			w.onClose(w)
+		}
+	}()
 
 	w.mu.Lock()
 	conn := w.conn
@@ -115,13 +127,15 @@ func (w *wsClient) close() {
 	}
 }
 
-func (w *wsClient) clearConn() {
+func (w *wsClient) clearConn() bool {
 	w.mu.Lock()
 	defer w.mu.Unlock()
+	closed := w.closed
 	if w.conn != nil {
 		w.conn.Close()
 		w.conn = nil
 	}
+	return closed
 }
 
 // buildWSURL converts an HTTP(S) server URL to a WS(S) URL for the AgileConfig WebSocket endpoint.

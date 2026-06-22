@@ -34,6 +34,10 @@ func WithEnv(env string) Option {
 // WithHTTPTimeout sets the HTTP request timeout. Default is 10 seconds.
 func WithHTTPTimeout(d time.Duration) Option {
 	return func(o *options) {
+		if d <= 0 {
+			o.httpTimeout = defaultHTTPTimeout
+			return
+		}
 		o.httpTimeout = d
 	}
 }
@@ -42,6 +46,10 @@ func WithHTTPTimeout(d time.Duration) Option {
 // Default is 30 seconds.
 func WithWSRetryMaxInterval(d time.Duration) Option {
 	return func(o *options) {
+		if d <= 0 {
+			o.wsRetryMaxInterval = defaultWSRetryMaxInterval
+			return
+		}
 		o.wsRetryMaxInterval = d
 	}
 }

@@ -16,12 +16,14 @@ type Client struct {
 	store *configStore
 	opts  options
 
-	ctx    context.Context
-	cancel context.CancelFunc
+	lifecycleMu sync.Mutex
+	started     bool
+	generation  uint64
+	ctx         context.Context
+	cancel      context.CancelFunc
 
 	ws           *wsClient
 	wsMu         sync.Mutex
-	pingTicker   *time.Ticker
 	reconnMu     sync.Mutex
 	reconnecting bool
 }
@@ -46,34 +48,51 @@ func NewClient(serverURL, appID, secret string, opts ...Option) *Client {
 // Start fetches configs from the server via HTTP and starts a WebSocket connection
 // for real-time updates. Returns an error if the initial config fetch fails.
 func (c *Client) Start(ctx context.Context) error {
+	c.lifecycleMu.Lock()
+	if c.started {
+		c.lifecycleMu.Unlock()
+		return fmt.Errorf("client already started")
+	}
+	c.generation++
+	generation := c.generation
 	c.ctx, c.cancel = context.WithCancel(ctx)
+	c.started = true
+	c.lifecycleMu.Unlock()
 
 	if err := c.loadConfigs(c.ctx); err != nil {
+		c.cancel()
+		c.lifecycleMu.Lock()
+		c.started = false
+		c.lifecycleMu.Unlock()
 		return fmt.Errorf("initial config load: %w", err)
 	}
 
-	c.startWebSocket()
+	c.startWebSocket(generation)
 
 	return nil
 }
 
 // Stop gracefully shuts down the client, closing the WebSocket connection.
 func (c *Client) Stop() {
-	// Acquire reconnMu to synchronize with any in-flight reconnect goroutine.
-	c.reconnMu.Lock()
+	c.lifecycleMu.Lock()
+	if !c.started {
+		c.lifecycleMu.Unlock()
+		return
+	}
+	c.started = false
 	if c.cancel != nil {
 		c.cancel()
 	}
+	c.lifecycleMu.Unlock()
+
+	// Stop new reconnect attempts and close the current WebSocket if one exists.
+	c.reconnMu.Lock()
 	c.wsMu.Lock()
 	if c.ws != nil {
 		c.ws.close()
 	}
 	c.wsMu.Unlock()
 	c.reconnMu.Unlock()
-
-	if c.pingTicker != nil {
-		c.pingTicker.Stop()
-	}
 }
 
 // Get returns the config value for the given key and whether it exists.
@@ -122,15 +141,19 @@ func (c *Client) loadConfigs(ctx context.Context) error {
 }
 
 // wsActionHandler returns a shared WebSocket action callback.
-func (c *Client) wsActionHandler() func(websocketAction) {
+func (c *Client) wsActionHandler(generation uint64) func(websocketAction) {
 	return func(action websocketAction) {
 		switch action.Action {
 		case "reload":
-			if err := c.loadConfigs(c.ctx); err != nil {
+			ctx, ok := c.activeContext(generation)
+			if !ok {
+				return
+			}
+			if err := c.loadConfigs(ctx); err != nil {
 				log.Printf("agileconfig: reload failed: %v", err)
 			}
 		case "offline":
-			go c.tryReconnect()
+			go c.tryReconnect(generation)
 		case "ping":
 			// Heartbeat response, no action needed
 		}
@@ -138,7 +161,7 @@ func (c *Client) wsActionHandler() func(websocketAction) {
 }
 
 // startWebSocket establishes a WebSocket connection in a background goroutine.
-func (c *Client) startWebSocket() {
+func (c *Client) startWebSocket(generation uint64) {
 	url, err := buildWSURL(c.tp.getServerURL())
 	if err != nil {
 		log.Printf("agileconfig: %v", err)
@@ -146,34 +169,51 @@ func (c *Client) startWebSocket() {
 	}
 
 	ws := newWSClient(url, c.tp.getAppID(), c.tp.getSecret(), c.opts.env, c.opts.httpTimeout,
-		c.wsActionHandler(),
+		c.wsActionHandler(generation),
+		func(ws *wsClient) {
+			if c.shouldReconnect(generation, ws) {
+				go c.tryReconnect(generation)
+			}
+		},
 	)
 	c.setWS(ws)
 
 	go func() {
-		if err := ws.connect(c.ctx); err != nil {
-			log.Printf("agileconfig: websocket connect failed: %v", err)
-			go c.tryReconnect()
+		ctx, ok := c.activeContext(generation)
+		if !ok {
 			return
 		}
-		c.startPing()
+		if err := ws.connect(ctx); err != nil {
+			log.Printf("agileconfig: websocket connect failed: %v", err)
+			if c.shouldReconnect(generation, ws) {
+				go c.tryReconnect(generation)
+			}
+			return
+		}
+		c.startPing(generation, ws)
 	}()
 }
 
 // startPing sends periodic heartbeat pings via WebSocket.
-func (c *Client) startPing() {
-	c.pingTicker = time.NewTicker(30 * time.Second)
-	defer c.pingTicker.Stop()
+func (c *Client) startPing(generation uint64, ws *wsClient) {
+	ticker := time.NewTicker(30 * time.Second)
+	defer ticker.Stop()
 
 	for {
+		ctx, ok := c.activeContext(generation)
+		if !ok {
+			return
+		}
+
 		select {
-		case <-c.pingTicker.C:
-			if ws := c.getWS(); ws != nil {
-				if err := ws.send("c:ping"); err != nil {
-					return
+		case <-ticker.C:
+			if err := ws.send("c:ping"); err != nil {
+				if c.shouldReconnect(generation, ws) {
+					go c.tryReconnect(generation)
 				}
+				return
 			}
-		case <-c.ctx.Done():
+		case <-ctx.Done():
 			return
 		}
 	}
@@ -185,14 +225,64 @@ func (c *Client) setWS(ws *wsClient) {
 	c.wsMu.Unlock()
 }
 
+func (c *Client) closeCurrentWS(generation uint64) bool {
+	c.lifecycleMu.Lock()
+	if !c.started || c.ctx == nil || c.generation != generation {
+		c.lifecycleMu.Unlock()
+		return false
+	}
+	c.wsMu.Lock()
+	ws := c.ws
+	c.wsMu.Unlock()
+	c.lifecycleMu.Unlock()
+
+	if ws != nil {
+		ws.close()
+	}
+	return true
+}
+
+func (c *Client) replaceWS(generation uint64, ws *wsClient) bool {
+	c.lifecycleMu.Lock()
+	if !c.started || c.ctx == nil || c.generation != generation {
+		c.lifecycleMu.Unlock()
+		return false
+	}
+	c.wsMu.Lock()
+	c.ws = ws
+	c.wsMu.Unlock()
+	c.lifecycleMu.Unlock()
+	return true
+}
+
 func (c *Client) getWS() *wsClient {
 	c.wsMu.Lock()
 	defer c.wsMu.Unlock()
 	return c.ws
 }
 
+func (c *Client) activeContext(generation uint64) (context.Context, bool) {
+	c.lifecycleMu.Lock()
+	defer c.lifecycleMu.Unlock()
+	return c.ctx, c.started && c.ctx != nil && c.generation == generation
+}
+
+func (c *Client) shouldReconnect(generation uint64, ws *wsClient) bool {
+	if _, ok := c.activeContext(generation); !ok {
+		return false
+	}
+
+	c.wsMu.Lock()
+	defer c.wsMu.Unlock()
+	return c.ws == ws
+}
+
 // tryReconnect guards reconnect with a mutex to prevent concurrent reconnection attempts.
-func (c *Client) tryReconnect() {
+func (c *Client) tryReconnect(generation uint64) {
+	if _, ok := c.activeContext(generation); !ok {
+		return
+	}
+
 	c.reconnMu.Lock()
 	if c.reconnecting {
 		c.reconnMu.Unlock()
@@ -207,23 +297,34 @@ func (c *Client) tryReconnect() {
 		c.reconnMu.Unlock()
 	}()
 
-	c.reconnect()
+	c.reconnect(generation)
 }
 
 // reconnect attempts to re-establish the WebSocket connection with exponential backoff.
-func (c *Client) reconnect() {
+func (c *Client) reconnect(generation uint64) {
 	backoff := 1 * time.Second
 	maxInterval := c.opts.wsRetryMaxInterval
+	if maxInterval <= 0 {
+		maxInterval = defaultWSRetryMaxInterval
+	}
+	if backoff > maxInterval {
+		backoff = maxInterval
+	}
 
 	for {
+		ctx, ok := c.activeContext(generation)
+		if !ok {
+			return
+		}
+
 		select {
-		case <-c.ctx.Done():
+		case <-ctx.Done():
 			return
 		case <-time.After(backoff):
 		}
 
-		if ws := c.getWS(); ws != nil {
-			ws.close()
+		if ok := c.closeCurrentWS(generation); !ok {
+			return
 		}
 
 		url, err := buildWSURL(c.tp.getServerURL())
@@ -232,21 +333,30 @@ func (c *Client) reconnect() {
 			return
 		}
 		ws := newWSClient(url, c.tp.getAppID(), c.tp.getSecret(), c.opts.env, c.opts.httpTimeout,
-			c.wsActionHandler(),
+			c.wsActionHandler(generation),
+			func(ws *wsClient) {
+				if c.shouldReconnect(generation, ws) {
+					go c.tryReconnect(generation)
+				}
+			},
 		)
-		c.setWS(ws)
 
-		if err := ws.connect(c.ctx); err != nil {
+		if ok := c.replaceWS(generation, ws); !ok {
+			ws.close()
+			return
+		}
+
+		if err := ws.connect(ctx); err != nil {
 			log.Printf("agileconfig: reconnect failed: %v", err)
 			backoff = time.Duration(math.Min(float64(backoff*2), float64(maxInterval)))
 			continue
 		}
 
-		if err := c.loadConfigs(c.ctx); err != nil {
+		if err := c.loadConfigs(ctx); err != nil {
 			log.Printf("agileconfig: post-reconnect load failed: %v", err)
 		}
 
-		go c.startPing()
+		go c.startPing(generation, ws)
 		return
 	}
 }

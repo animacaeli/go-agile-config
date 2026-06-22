@@ -54,6 +54,7 @@ func TestWSClient_ConnectAndReceiveReload(t *testing.T) {
 				}
 			}
 		},
+		nil,
 	)
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -123,6 +124,7 @@ func TestWSClient_OfflineAction(t *testing.T) {
 				}
 			}
 		},
+		nil,
 	)
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -182,6 +184,7 @@ func TestWSClient_PingPong(t *testing.T) {
 				}
 			}
 		},
+		nil,
 	)
 
 	ctx, cancel := context.WithCancel(context.Background())

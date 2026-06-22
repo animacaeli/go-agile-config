@@ -11,6 +11,8 @@ import (
 	"time"
 )
 
+const maxErrorResponseBody = 16 * 1024
+
 // apiConfig mirrors the AgileConfig API response item.
 // The server returns JSON with PascalCase field names.
 type apiConfig struct {
@@ -65,7 +67,7 @@ func (t *transport) fetchConfigs(ctx context.Context, env string) ([]apiConfig, 
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
-		body, _ := io.ReadAll(resp.Body)
+		body, _ := io.ReadAll(io.LimitReader(resp.Body, maxErrorResponseBody))
 		return nil, "", fmt.Errorf("server returned %d: %s", resp.StatusCode, string(body))
 	}
 

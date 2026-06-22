@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 )
@@ -81,5 +82,24 @@ func TestTransport_FetchConfigs_Unauthorized(t *testing.T) {
 	_, _, err := tp.fetchConfigs(context.Background(), "")
 	if err == nil {
 		t.Fatal("expected error for 401 response")
+	}
+}
+
+func TestTransport_FetchConfigs_ServerErrorLimitsResponseBody(t *testing.T) {
+	largeBody := strings.Repeat("x", maxErrorResponseBody+1024)
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Error(w, largeBody, http.StatusInternalServerError)
+	}))
+	defer srv.Close()
+
+	tp := newTransport(srv.URL, "app1", "secret1", 5*time.Second)
+	_, _, err := tp.fetchConfigs(context.Background(), "")
+	if err == nil {
+		t.Fatal("expected error for 500 response")
+	}
+
+	if len(err.Error()) > maxErrorResponseBody+128 {
+		t.Fatalf("expected limited error body, got error length %d", len(err.Error()))
 	}
 }

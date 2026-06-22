@@ -6,7 +6,9 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"sync"
+	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/gorilla/websocket"
 )
@@ -230,4 +232,250 @@ func TestClient_Stop(t *testing.T) {
 
 	client.Stop()
 	client.Stop()
+}
+
+func TestClient_Start_WhenAlreadyStarted_ReturnsError(t *testing.T) {
+	configs := []apiConfig{
+		{AppId: "app1", Key: "a", Value: "1"},
+	}
+
+	srv := testServer(configs)
+	defer srv.Close()
+
+	client := NewClient(srv.URL, "app1", "secret1")
+	err := client.Start(context.Background())
+	if err != nil {
+		t.Fatalf("Start failed: %v", err)
+	}
+	defer client.Stop()
+
+	err = client.Start(context.Background())
+	if err == nil {
+		t.Fatal("expected error when starting an already started client")
+	}
+}
+
+func TestClient_WebSocketUnexpectedClose_Reconnects(t *testing.T) {
+	configs := []apiConfig{
+		{AppId: "app1", Key: "a", Value: "1"},
+	}
+
+	var wsConnections int32
+	firstClosed := make(chan struct{})
+	reconnected := make(chan struct{})
+	closeFirstOnce := sync.Once{}
+	reconnectedOnce := sync.Once{}
+
+	upgrader := websocket.Upgrader{CheckOrigin: func(r *http.Request) bool { return true }}
+	mux := http.NewServeMux()
+
+	mux.HandleFunc("/api/Config/app/", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(configs)
+	})
+
+	mux.HandleFunc("/ws", func(w http.ResponseWriter, r *http.Request) {
+		conn, err := upgrader.Upgrade(w, r, nil)
+		if err != nil {
+			return
+		}
+
+		n := atomic.AddInt32(&wsConnections, 1)
+		if n == 1 {
+			conn.Close()
+			closeFirstOnce.Do(func() {
+				close(firstClosed)
+			})
+			return
+		}
+
+		reconnectedOnce.Do(func() {
+			close(reconnected)
+		})
+		defer conn.Close()
+		<-r.Context().Done()
+	})
+
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+
+	client := NewClient(srv.URL, "app1", "secret1",
+		WithWSRetryMaxInterval(10*time.Millisecond),
+	)
+	err := client.Start(context.Background())
+	if err != nil {
+		t.Fatalf("Start failed: %v", err)
+	}
+	defer client.Stop()
+
+	select {
+	case <-firstClosed:
+	case <-time.After(3 * time.Second):
+		t.Fatal("timeout waiting for first websocket connection to close")
+	}
+
+	start := time.Now()
+	select {
+	case <-reconnected:
+	case <-time.After(3 * time.Second):
+		t.Fatal("timeout waiting for websocket reconnect")
+	}
+	if elapsed := time.Since(start); elapsed > 500*time.Millisecond {
+		t.Fatalf("expected reconnect to honor max interval, took %s", elapsed)
+	}
+}
+
+func TestClient_StartAfterStop_IgnoresStaleConnectFailure(t *testing.T) {
+	configs := []apiConfig{
+		{AppId: "app1", Key: "a", Value: "1"},
+	}
+
+	var wsRequests int32
+	allowFirstWS := make(chan struct{})
+	firstWSStarted := make(chan struct{})
+	firstWSReleased := make(chan struct{})
+
+	upgrader := websocket.Upgrader{CheckOrigin: func(r *http.Request) bool { return true }}
+	mux := http.NewServeMux()
+
+	mux.HandleFunc("/api/Config/app/", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(configs)
+	})
+
+	mux.HandleFunc("/ws", func(w http.ResponseWriter, r *http.Request) {
+		n := atomic.AddInt32(&wsRequests, 1)
+		if n == 1 {
+			close(firstWSStarted)
+			<-allowFirstWS
+			close(firstWSReleased)
+			http.Error(w, "late failure", http.StatusServiceUnavailable)
+			return
+		}
+
+		conn, err := upgrader.Upgrade(w, r, nil)
+		if err != nil {
+			return
+		}
+		defer conn.Close()
+		<-r.Context().Done()
+	})
+
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+
+	client := NewClient(srv.URL, "app1", "secret1",
+		WithWSRetryMaxInterval(10*time.Millisecond),
+	)
+	err := client.Start(context.Background())
+	if err != nil {
+		t.Fatalf("first Start failed: %v", err)
+	}
+
+	select {
+	case <-firstWSStarted:
+	case <-time.After(3 * time.Second):
+		t.Fatal("timeout waiting for first websocket request")
+	}
+
+	client.Stop()
+
+	err = client.Start(context.Background())
+	if err != nil {
+		t.Fatalf("second Start failed: %v", err)
+	}
+	defer client.Stop()
+
+	close(allowFirstWS)
+
+	select {
+	case <-firstWSReleased:
+	case <-time.After(3 * time.Second):
+		t.Fatal("timeout waiting for stale websocket request to finish")
+	}
+
+	time.Sleep(100 * time.Millisecond)
+
+	if got := atomic.LoadInt32(&wsRequests); got != 2 {
+		t.Fatalf("expected stale connect failure to be ignored, got %d websocket requests", got)
+	}
+}
+
+func TestClient_StartAfterStop_IgnoresStaleReconnectTimer(t *testing.T) {
+	configs := []apiConfig{
+		{AppId: "app1", Key: "a", Value: "1"},
+	}
+
+	var wsRequests int32
+	firstClosed := make(chan struct{})
+	secondConnected := make(chan struct{})
+	reconnectedOnce := sync.Once{}
+	secondOnce := sync.Once{}
+
+	upgrader := websocket.Upgrader{CheckOrigin: func(r *http.Request) bool { return true }}
+	mux := http.NewServeMux()
+
+	mux.HandleFunc("/api/Config/app/", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(configs)
+	})
+
+	mux.HandleFunc("/ws", func(w http.ResponseWriter, r *http.Request) {
+		conn, err := upgrader.Upgrade(w, r, nil)
+		if err != nil {
+			return
+		}
+
+		n := atomic.AddInt32(&wsRequests, 1)
+		if n == 1 {
+			conn.Close()
+			reconnectedOnce.Do(func() {
+				close(firstClosed)
+			})
+			return
+		}
+
+		secondOnce.Do(func() {
+			close(secondConnected)
+		})
+		defer conn.Close()
+		<-r.Context().Done()
+	})
+
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+
+	client := NewClient(srv.URL, "app1", "secret1",
+		WithWSRetryMaxInterval(10*time.Millisecond),
+	)
+	err := client.Start(context.Background())
+	if err != nil {
+		t.Fatalf("first Start failed: %v", err)
+	}
+
+	select {
+	case <-firstClosed:
+	case <-time.After(3 * time.Second):
+		t.Fatal("timeout waiting for first websocket close")
+	}
+
+	client.Stop()
+
+	err = client.Start(context.Background())
+	if err != nil {
+		t.Fatalf("second Start failed: %v", err)
+	}
+	defer client.Stop()
+
+	select {
+	case <-secondConnected:
+	case <-time.After(3 * time.Second):
+		t.Fatal("timeout waiting for second websocket connection")
+	}
+
+	time.Sleep(1200 * time.Millisecond)
+
+	if got := atomic.LoadInt32(&wsRequests); got != 2 {
+		t.Fatalf("expected stale reconnect timer to be ignored, got %d websocket requests", got)
+	}
 }
