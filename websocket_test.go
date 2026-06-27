@@ -45,7 +45,7 @@ func TestWSClient_ConnectAndReceiveReload(t *testing.T) {
 	defer srv.Close()
 
 	wsURL := "ws" + strings.TrimPrefix(srv.URL, "http")
-	ws := newWSClient(wsURL, "app1", "secret1", "DEV", 5*time.Second,
+	ws := newWSClient(wsURL, "app1", "secret1", "DEV", 5*time.Second, defaultMaxWSMessageSize,
 		func(action websocketAction) {
 			if action.Action == "reload" {
 				select {
@@ -115,7 +115,7 @@ func TestWSClient_OfflineAction(t *testing.T) {
 	defer srv.Close()
 
 	wsURL := "ws" + strings.TrimPrefix(srv.URL, "http")
-	ws := newWSClient(wsURL, "app1", "secret1", "DEV", 5*time.Second,
+	ws := newWSClient(wsURL, "app1", "secret1", "DEV", 5*time.Second, defaultMaxWSMessageSize,
 		func(action websocketAction) {
 			if action.Action == "offline" {
 				select {
@@ -175,7 +175,7 @@ func TestWSClient_PingPong(t *testing.T) {
 	defer srv.Close()
 
 	wsURL := "ws" + strings.TrimPrefix(srv.URL, "http")
-	ws := newWSClient(wsURL, "app1", "secret1", "DEV", 5*time.Second,
+	ws := newWSClient(wsURL, "app1", "secret1", "DEV", 5*time.Second, defaultMaxWSMessageSize,
 		func(action websocketAction) {
 			if action.Action == "ping" {
 				select {
@@ -207,6 +207,48 @@ func TestWSClient_PingPong(t *testing.T) {
 	}
 
 	ws.close()
+}
+
+func TestWSClient_ReadLimitClosesOversizedMessage(t *testing.T) {
+	closed := make(chan struct{}, 1)
+	upgrader := websocket.Upgrader{CheckOrigin: func(r *http.Request) bool { return true }}
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		conn, err := upgrader.Upgrade(w, r, nil)
+		if err != nil {
+			return
+		}
+		defer conn.Close()
+		conn.WriteMessage(websocket.TextMessage, []byte(strings.Repeat("x", 128)))
+	}))
+	defer srv.Close()
+
+	wsURL := "ws" + strings.TrimPrefix(srv.URL, "http")
+	ws := newWSClient(wsURL, "app1", "secret1", "DEV", 5*time.Second, 16,
+		func(action websocketAction) {
+			t.Fatalf("unexpected action: %+v", action)
+		},
+		func(*wsClient) {
+			select {
+			case closed <- struct{}{}:
+			default:
+			}
+		},
+	)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	if err := ws.connect(ctx); err != nil {
+		t.Fatalf("connect failed: %v", err)
+	}
+	defer ws.close()
+
+	select {
+	case <-closed:
+	case <-time.After(3 * time.Second):
+		t.Fatal("timeout waiting for oversized message close")
+	}
 }
 
 func TestWSURL(t *testing.T) {

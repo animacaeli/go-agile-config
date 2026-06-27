@@ -22,6 +22,9 @@ type Client struct {
 	ctx         context.Context
 	cancel      context.CancelFunc
 
+	timelineMu sync.RWMutex
+	timelineID string
+
 	ws           *wsClient
 	wsMu         sync.Mutex
 	reconnMu     sync.Mutex
@@ -36,7 +39,7 @@ func NewClient(serverURL, appID, secret string, opts ...Option) *Client {
 		opt(&o)
 	}
 
-	tp := newTransport(serverURL, appID, secret, o.httpTimeout)
+	tp := newTransport(serverURL, appID, secret, o)
 
 	return &Client{
 		tp:    tp,
@@ -121,10 +124,11 @@ func (c *Client) GetAll() map[string]string {
 
 // loadConfigs fetches all published configs from the server and updates the store.
 func (c *Client) loadConfigs(ctx context.Context) error {
-	configs, _, err := c.tp.fetchConfigs(ctx, c.opts.env)
+	configs, timelineID, err := c.tp.fetchConfigs(ctx, c.opts.env)
 	if err != nil {
 		return err
 	}
+	c.setTimelineID(timelineID)
 
 	data := make(map[string]string, len(configs))
 	for _, cfg := range configs {
@@ -133,8 +137,8 @@ func (c *Client) loadConfigs(ctx context.Context) error {
 	}
 
 	changed := c.store.reload(data)
-	if len(changed) > 0 && c.opts.onChange != nil {
-		c.opts.onChange(changed)
+	if len(changed) > 0 {
+		c.notifyChange(changed)
 	}
 
 	return nil
@@ -155,7 +159,11 @@ func (c *Client) wsActionHandler(generation uint64) func(websocketAction) {
 		case "offline":
 			go c.tryReconnect(generation)
 		case "ping":
-			// Heartbeat response, no action needed
+			ctx, ok := c.activeContext(generation)
+			if !ok {
+				return
+			}
+			c.reloadIfTimelineChanged(ctx, action.Data)
 		}
 	}
 }
@@ -169,6 +177,7 @@ func (c *Client) startWebSocket(generation uint64) {
 	}
 
 	ws := newWSClient(url, c.tp.getAppID(), c.tp.getSecret(), c.opts.env, c.opts.httpTimeout,
+		c.opts.maxWSMessageSize,
 		c.wsActionHandler(generation),
 		func(ws *wsClient) {
 			if c.shouldReconnect(generation, ws) {
@@ -196,7 +205,11 @@ func (c *Client) startWebSocket(generation uint64) {
 
 // startPing sends periodic heartbeat pings via WebSocket.
 func (c *Client) startPing(generation uint64, ws *wsClient) {
-	ticker := time.NewTicker(30 * time.Second)
+	interval := c.opts.wsPingInterval
+	if interval <= 0 {
+		interval = defaultWSPingInterval
+	}
+	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
 
 	for {
@@ -217,6 +230,30 @@ func (c *Client) startPing(generation uint64, ws *wsClient) {
 			return
 		}
 	}
+}
+
+func (c *Client) reloadIfTimelineChanged(ctx context.Context, timelineID string) {
+	if timelineID == "" || timelineID == c.getTimelineID() {
+		return
+	}
+	if err := c.loadConfigs(ctx); err != nil {
+		log.Printf("agileconfig: reload failed: %v", err)
+	}
+}
+
+func (c *Client) setTimelineID(timelineID string) {
+	if timelineID == "" {
+		return
+	}
+	c.timelineMu.Lock()
+	c.timelineID = timelineID
+	c.timelineMu.Unlock()
+}
+
+func (c *Client) getTimelineID() string {
+	c.timelineMu.RLock()
+	defer c.timelineMu.RUnlock()
+	return c.timelineID
 }
 
 func (c *Client) setWS(ws *wsClient) {
@@ -333,6 +370,7 @@ func (c *Client) reconnect(generation uint64) {
 			return
 		}
 		ws := newWSClient(url, c.tp.getAppID(), c.tp.getSecret(), c.opts.env, c.opts.httpTimeout,
+			c.opts.maxWSMessageSize,
 			c.wsActionHandler(generation),
 			func(ws *wsClient) {
 				if c.shouldReconnect(generation, ws) {
@@ -359,4 +397,16 @@ func (c *Client) reconnect(generation uint64) {
 		go c.startPing(generation, ws)
 		return
 	}
+}
+
+func (c *Client) notifyChange(changed []string) {
+	if c.opts.onChange == nil {
+		return
+	}
+	defer func() {
+		if r := recover(); r != nil {
+			log.Printf("agileconfig: onChange panic: %v", r)
+		}
+	}()
+	c.opts.onChange(append([]string(nil), changed...))
 }

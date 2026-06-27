@@ -22,13 +22,14 @@ type websocketAction struct {
 
 // wsClient manages a WebSocket connection to the AgileConfig server.
 type wsClient struct {
-	url      string
-	appID    string
-	secret   string
-	env      string
-	timeout  time.Duration
-	onAction func(action websocketAction)
-	onClose  func(ws *wsClient)
+	url       string
+	appID     string
+	secret    string
+	env       string
+	timeout   time.Duration
+	readLimit int64
+	onAction  func(action websocketAction)
+	onClose   func(ws *wsClient)
 
 	mu     sync.Mutex
 	conn   *websocket.Conn
@@ -38,17 +39,19 @@ type wsClient struct {
 func newWSClient(
 	url, appID, secret, env string,
 	timeout time.Duration,
+	readLimit int64,
 	onAction func(websocketAction),
 	onClose func(*wsClient),
 ) *wsClient {
 	return &wsClient{
-		url:      url,
-		appID:    appID,
-		secret:   secret,
-		env:      env,
-		timeout:  timeout,
-		onAction: onAction,
-		onClose:  onClose,
+		url:       url,
+		appID:     appID,
+		secret:    secret,
+		env:       env,
+		timeout:   timeout,
+		readLimit: readLimit,
+		onAction:  onAction,
+		onClose:   onClose,
 	}
 }
 
@@ -63,6 +66,9 @@ func (w *wsClient) connect(ctx context.Context) error {
 	conn, _, err := dialer.DialContext(ctx, w.url, header)
 	if err != nil {
 		return fmt.Errorf("websocket dial: %w", err)
+	}
+	if w.readLimit > 0 {
+		conn.SetReadLimit(w.readLimit)
 	}
 
 	w.mu.Lock()
@@ -140,7 +146,7 @@ func (w *wsClient) clearConn() bool {
 
 // buildWSURL converts an HTTP(S) server URL to a WS(S) URL for the AgileConfig WebSocket endpoint.
 func buildWSURL(serverURL string) (string, error) {
-	u := strings.TrimRight(serverURL, "/")
+	u := normalizeServerURL(serverURL)
 	if strings.HasPrefix(u, "https://") {
 		return "wss" + strings.TrimPrefix(u, "https") + "/ws", nil
 	}

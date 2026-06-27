@@ -48,6 +48,11 @@ func testServer(configs []apiConfig) *httptest.Server {
 	return httptest.NewServer(mux)
 }
 
+func newTestClient(serverURL, appID, secret string, opts ...Option) *Client {
+	opts = append([]Option{WithInsecureHTTP()}, opts...)
+	return NewClient(serverURL, appID, secret, opts...)
+}
+
 func TestClient_StartAndGet(t *testing.T) {
 	configs := []apiConfig{
 		{AppId: "app1", Group: "db", Key: "host", Value: "localhost"},
@@ -58,7 +63,7 @@ func TestClient_StartAndGet(t *testing.T) {
 	srv := testServer(configs)
 	defer srv.Close()
 
-	client := NewClient(srv.URL, "app1", "secret1",
+	client := newTestClient(srv.URL, "app1", "secret1",
 		WithEnv("DEV"),
 	)
 
@@ -92,7 +97,7 @@ func TestClient_GetString(t *testing.T) {
 	srv := testServer(configs)
 	defer srv.Close()
 
-	client := NewClient(srv.URL, "app1", "secret1")
+	client := newTestClient(srv.URL, "app1", "secret1")
 	err := client.Start(context.Background())
 	if err != nil {
 		t.Fatalf("Start failed: %v", err)
@@ -118,7 +123,7 @@ func TestClient_GetByGroup(t *testing.T) {
 	srv := testServer(configs)
 	defer srv.Close()
 
-	client := NewClient(srv.URL, "app1", "secret1")
+	client := newTestClient(srv.URL, "app1", "secret1")
 	err := client.Start(context.Background())
 	if err != nil {
 		t.Fatalf("Start failed: %v", err)
@@ -145,7 +150,7 @@ func TestClient_GetAll(t *testing.T) {
 	srv := testServer(configs)
 	defer srv.Close()
 
-	client := NewClient(srv.URL, "app1", "secret1")
+	client := newTestClient(srv.URL, "app1", "secret1")
 	err := client.Start(context.Background())
 	if err != nil {
 		t.Fatalf("Start failed: %v", err)
@@ -167,7 +172,7 @@ func TestClient_Start_ServerDown(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	client := NewClient(srv.URL, "app1", "secret1")
+	client := newTestClient(srv.URL, "app1", "secret1")
 	err := client.Start(context.Background())
 	if err == nil {
 		t.Fatal("expected error when server returns 500")
@@ -186,7 +191,7 @@ func TestClient_OnChange(t *testing.T) {
 	var changeMu sync.Mutex
 	var changedKeys []string
 
-	client := NewClient(srv.URL, "app1", "secret1",
+	client := newTestClient(srv.URL, "app1", "secret1",
 		WithOnChange(func(keys []string) {
 			changeMu.Lock()
 			changedKeys = keys
@@ -216,6 +221,102 @@ func TestClient_OnChange(t *testing.T) {
 	}
 }
 
+func TestClient_OnChangePanicDoesNotPropagate(t *testing.T) {
+	configs := []apiConfig{
+		{AppId: "app1", Key: "a", Value: "1"},
+	}
+
+	srv := testServer(configs)
+	defer srv.Close()
+
+	client := newTestClient(srv.URL, "app1", "secret1",
+		WithOnChange(func(keys []string) {
+			panic("boom")
+		}),
+	)
+
+	if err := client.Start(context.Background()); err != nil {
+		t.Fatalf("Start failed: %v", err)
+	}
+	defer client.Stop()
+
+	if value, ok := client.Get("a"); !ok || value != "1" {
+		t.Fatalf("expected loaded config after panic, got %q, ok=%v", value, ok)
+	}
+}
+
+func TestClient_PingWithNewTimeline_ReloadsConfigs(t *testing.T) {
+	var fetches int32
+	reloaded := make(chan struct{}, 1)
+
+	upgrader := websocket.Upgrader{CheckOrigin: func(r *http.Request) bool { return true }}
+	mux := http.NewServeMux()
+
+	mux.HandleFunc("/api/Config/app/", func(w http.ResponseWriter, r *http.Request) {
+		n := atomic.AddInt32(&fetches, 1)
+		w.Header().Set("publish-time-line-id", "timeline-1")
+		if n > 1 {
+			w.Header().Set("publish-time-line-id", "timeline-2")
+		}
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode([]apiConfig{
+			{AppId: "app1", Key: "a", Value: string(rune('0' + n))},
+		})
+	})
+
+	mux.HandleFunc("/ws", func(w http.ResponseWriter, r *http.Request) {
+		conn, err := upgrader.Upgrade(w, r, nil)
+		if err != nil {
+			return
+		}
+		defer conn.Close()
+
+		for {
+			_, msg, err := conn.ReadMessage()
+			if err != nil {
+				return
+			}
+			if string(msg) == "c:ping" {
+				action := websocketAction{Module: "c", Action: "ping", Data: "timeline-2"}
+				data, _ := json.Marshal(action)
+				conn.WriteMessage(websocket.TextMessage, data)
+				return
+			}
+		}
+	})
+
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+
+	client := newTestClient(srv.URL, "app1", "secret1",
+		WithWSPingInterval(10*time.Millisecond),
+		WithOnChange(func(keys []string) {
+			if atomic.LoadInt32(&fetches) > 1 {
+				select {
+				case reloaded <- struct{}{}:
+				default:
+				}
+			}
+		}),
+	)
+
+	if err := client.Start(context.Background()); err != nil {
+		t.Fatalf("Start failed: %v", err)
+	}
+	defer client.Stop()
+
+	select {
+	case <-reloaded:
+	case <-time.After(3 * time.Second):
+		t.Fatal("timeout waiting for reload after timeline change")
+	}
+
+	value, ok := client.Get("a")
+	if !ok || value != "2" {
+		t.Fatalf("expected reloaded a=2, got %q, ok=%v", value, ok)
+	}
+}
+
 func TestClient_Stop(t *testing.T) {
 	configs := []apiConfig{
 		{AppId: "app1", Key: "a", Value: "1"},
@@ -224,7 +325,7 @@ func TestClient_Stop(t *testing.T) {
 	srv := testServer(configs)
 	defer srv.Close()
 
-	client := NewClient(srv.URL, "app1", "secret1")
+	client := newTestClient(srv.URL, "app1", "secret1")
 	err := client.Start(context.Background())
 	if err != nil {
 		t.Fatalf("Start failed: %v", err)
@@ -242,7 +343,7 @@ func TestClient_Start_WhenAlreadyStarted_ReturnsError(t *testing.T) {
 	srv := testServer(configs)
 	defer srv.Close()
 
-	client := NewClient(srv.URL, "app1", "secret1")
+	client := newTestClient(srv.URL, "app1", "secret1")
 	err := client.Start(context.Background())
 	if err != nil {
 		t.Fatalf("Start failed: %v", err)
@@ -299,7 +400,7 @@ func TestClient_WebSocketUnexpectedClose_Reconnects(t *testing.T) {
 	srv := httptest.NewServer(mux)
 	defer srv.Close()
 
-	client := NewClient(srv.URL, "app1", "secret1",
+	client := newTestClient(srv.URL, "app1", "secret1",
 		WithWSRetryMaxInterval(10*time.Millisecond),
 	)
 	err := client.Start(context.Background())
@@ -364,7 +465,7 @@ func TestClient_StartAfterStop_IgnoresStaleConnectFailure(t *testing.T) {
 	srv := httptest.NewServer(mux)
 	defer srv.Close()
 
-	client := NewClient(srv.URL, "app1", "secret1",
+	client := newTestClient(srv.URL, "app1", "secret1",
 		WithWSRetryMaxInterval(10*time.Millisecond),
 	)
 	err := client.Start(context.Background())
@@ -445,7 +546,7 @@ func TestClient_StartAfterStop_IgnoresStaleReconnectTimer(t *testing.T) {
 	srv := httptest.NewServer(mux)
 	defer srv.Close()
 
-	client := NewClient(srv.URL, "app1", "secret1",
+	client := newTestClient(srv.URL, "app1", "secret1",
 		WithWSRetryMaxInterval(10*time.Millisecond),
 	)
 	err := client.Start(context.Background())

@@ -4,12 +4,24 @@ import (
 	"context"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
 	"testing"
 	"time"
 )
+
+func newTestTransport(serverURL, appID, secret string, timeout time.Duration, opts ...Option) *transport {
+	o := defaultOptions()
+	o.httpTimeout = timeout
+	WithInsecureHTTP()(&o)
+	for _, opt := range opts {
+		opt(&o)
+	}
+	return newTransport(serverURL, appID, secret, o)
+}
 
 func TestTransport_FetchConfigs(t *testing.T) {
 	configs := []apiConfig{
@@ -40,7 +52,7 @@ func TestTransport_FetchConfigs(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	tp := newTransport(srv.URL, "app1", "secret1", 5*time.Second)
+	tp := newTestTransport(srv.URL, "app1", "secret1", 5*time.Second)
 	result, timelineID, err := tp.fetchConfigs(context.Background(), "DEV")
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
@@ -59,13 +71,110 @@ func TestTransport_FetchConfigs(t *testing.T) {
 	}
 }
 
+func TestTransport_FetchConfigs_RejectsInsecureHTTPByDefault(t *testing.T) {
+	tp := newTransport("http://example.com", "app1", "secret1", defaultOptions())
+
+	_, _, err := tp.fetchConfigs(context.Background(), "")
+	if err == nil {
+		t.Fatal("expected insecure HTTP error")
+	}
+	if !strings.Contains(err.Error(), "WithInsecureHTTP") {
+		t.Fatalf("expected WithInsecureHTTP guidance, got %v", err)
+	}
+}
+
+func TestTransport_FetchConfigs_RejectsHTTPSDowngradeRedirect(t *testing.T) {
+	target := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		t.Fatal("unexpected insecure redirect target request")
+	}))
+	defer target.Close()
+
+	source := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Redirect(w, r, target.URL+"/api/Config/app/app1", http.StatusTemporaryRedirect)
+	}))
+	defer source.Close()
+
+	o := defaultOptions()
+	tp := newTransport(source.URL, "app1", "secret1", o)
+	tp.client.Transport = source.Client().Transport
+
+	_, _, err := tp.fetchConfigs(context.Background(), "")
+	if err == nil {
+		t.Fatal("expected insecure redirect error")
+	}
+	if !strings.Contains(err.Error(), "refusing redirect to insecure URL") {
+		t.Fatalf("expected insecure redirect error, got %v", err)
+	}
+}
+
+func TestTransport_FetchConfigs_AllowsHTTPRedirectWhenInsecureEnabled(t *testing.T) {
+	target := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode([]apiConfig{{AppId: "app1", Key: "a", Value: "1"}})
+	}))
+	defer target.Close()
+
+	source := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Redirect(w, r, target.URL+"/api/Config/app/app1", http.StatusTemporaryRedirect)
+	}))
+	defer source.Close()
+
+	o := defaultOptions()
+	WithInsecureHTTP()(&o)
+	tp := newTransport(source.URL, "app1", "secret1", o)
+	tp.client.Transport = source.Client().Transport
+
+	configs, _, err := tp.fetchConfigs(context.Background(), "")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(configs) != 1 || configs[0].Key != "a" {
+		t.Fatalf("unexpected configs: %+v", configs)
+	}
+}
+
+func TestTransport_FetchConfigs_NormalizesTrailingSlash(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/api/Config/app/app1" {
+			t.Errorf("unexpected path: %s", r.URL.Path)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode([]apiConfig{{AppId: "app1", Key: "a", Value: "1"}})
+	}))
+	defer srv.Close()
+
+	tp := newTestTransport(srv.URL+"/", "app1", "secret1", 5*time.Second)
+	if _, _, err := tp.fetchConfigs(context.Background(), ""); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+}
+
+func TestTransport_FetchConfigs_LimitsSuccessResponseBody(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.Write([]byte(`[{"AppId":"app1","Key":"a","Value":"`))
+		w.Write([]byte(strings.Repeat("x", 256)))
+		w.Write([]byte(`"}]`))
+	}))
+	defer srv.Close()
+
+	tp := newTestTransport(srv.URL, "app1", "secret1", 5*time.Second, WithMaxResponseBody(32))
+	_, _, err := tp.fetchConfigs(context.Background(), "")
+	if err == nil {
+		t.Fatal("expected response size error")
+	}
+	if !errors.Is(err, io.ErrUnexpectedEOF) && !strings.Contains(err.Error(), "exceeds") {
+		t.Fatalf("expected response size or EOF error, got %v", err)
+	}
+}
+
 func TestTransport_FetchConfigs_ServerError(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "internal error", http.StatusInternalServerError)
 	}))
 	defer srv.Close()
 
-	tp := newTransport(srv.URL, "app1", "secret1", 5*time.Second)
+	tp := newTestTransport(srv.URL, "app1", "secret1", 5*time.Second)
 	_, _, err := tp.fetchConfigs(context.Background(), "")
 	if err == nil {
 		t.Fatal("expected error for 500 response")
@@ -78,7 +187,7 @@ func TestTransport_FetchConfigs_Unauthorized(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	tp := newTransport(srv.URL, "app1", "wrong-secret", 5*time.Second)
+	tp := newTestTransport(srv.URL, "app1", "wrong-secret", 5*time.Second)
 	_, _, err := tp.fetchConfigs(context.Background(), "")
 	if err == nil {
 		t.Fatal("expected error for 401 response")
@@ -93,7 +202,7 @@ func TestTransport_FetchConfigs_ServerErrorLimitsResponseBody(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	tp := newTransport(srv.URL, "app1", "secret1", 5*time.Second)
+	tp := newTestTransport(srv.URL, "app1", "secret1", 5*time.Second)
 	_, _, err := tp.fetchConfigs(context.Background(), "")
 	if err == nil {
 		t.Fatal("expected error for 500 response")
