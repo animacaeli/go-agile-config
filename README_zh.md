@@ -9,6 +9,8 @@
 - 通过 HTTP 以 `appId:secret` Basic Auth 方式拉取已发布的配置
 - 通过 WebSocket 实时接收配置变更，支持自动重连
 - 线程安全的内存配置存储，支持变更检测
+- 默认使用 HTTPS/WSS，明文 HTTP 需要显式开启
+- HTTP 响应体和 WebSocket 消息都有大小上限
 - 函数式选项，灵活配置
 - 除 [gorilla/websocket](https://github.com/gorilla/websocket) 外零外部依赖
 
@@ -33,7 +35,7 @@ import (
 
 func main() {
     client := agileconfig.NewClient(
-        "http://localhost:5000",
+        "https://config.example.com",
         "my-app-id",
         "my-app-secret",
         agileconfig.WithEnv("DEV"),
@@ -66,7 +68,28 @@ client := agileconfig.NewClient(serverURL, appID, secret, opts...)
 | `WithEnv(env)` | `""` | 环境名称（如 `"DEV"`、`"PROD"`） |
 | `WithHTTPTimeout(d)` | `10s` | HTTP 请求超时时间 |
 | `WithWSRetryMaxInterval(d)` | `30s` | WebSocket 重连最大退避间隔 |
+| `WithWSPingInterval(d)` | `30s` | 检查服务端发布时间线的间隔 |
+| `WithMaxResponseBody(n)` | `10 MiB` | HTTP 配置响应体最大字节数 |
+| `WithMaxWSMessageSize(n)` | `64 KiB` | WebSocket 消息最大字节数 |
+| `WithInsecureHTTP()` | 禁用 | 允许在可信本地开发环境使用 `http://` 和 `ws://` |
 | `WithOnChange(fn)` | `nil` | 配置变更时的回调函数 |
+
+### 传输安全
+
+客户端默认要求 HTTPS/WSS，因为 AgileConfig 凭据会通过 Basic Auth 发送。除非显式设置 `WithInsecureHTTP()`，否则会拒绝明文 HTTP URL 和 HTTPS 到 HTTP 的降级重定向。
+
+`WithInsecureHTTP()` 只建议用于可信本地开发或私有测试网络：
+
+```go
+client := agileconfig.NewClient(
+    "http://localhost:5000",
+    "my-app-id",
+    "my-app-secret",
+    agileconfig.WithInsecureHTTP(),
+)
+```
+
+未开启 `WithInsecureHTTP()` 时，重定向只允许跳转到 HTTPS 目标；重定向循环最多 10 次后停止。
 
 ### 生命周期
 
@@ -110,16 +133,44 @@ client := agileconfig.NewClient(serverURL, appID, secret,
 
 当服务端通过 WebSocket 推送 `reload` 动作时，`OnChange` 回调将被触发。客户端会自动重新拉取所有配置，并报告哪些键发生了变化（新增、删除或修改）。
 
+### 多 AppId
+
+当一个进程依赖多个 AgileConfig appId 时，可以使用 `MultiClient`。每个 app 都会维护自己的 HTTP 拉取和 WebSocket 连接。
+
+```go
+client, err := agileconfig.NewMultiClient(serverURL, []agileconfig.MultiClientApp{
+    {AppID: "mysql", Secret: "mysql-secret"},
+    {AppID: "redis", Secret: "redis-secret"},
+},
+    agileconfig.WithMultiClientOptions(agileconfig.WithEnv("DEV")),
+    agileconfig.WithMultiOnChange(func(appID string, changedKeys []string) {
+        log.Printf("%s changed: %v", appID, changedKeys)
+    }),
+)
+if err != nil {
+    log.Fatal(err)
+}
+
+if err := client.Start(context.Background()); err != nil {
+    log.Fatal(err)
+}
+defer client.Stop()
+
+mysqlHost, _ := client.GetByGroup("mysql", "db", "host")
+redisAddr := client.GetString("redis", "addr", "localhost:6379")
+all := client.GetAll() // map[appID]map[key]value
+```
+
 ## 工作原理
 
 ```
 Start()
   │
-  ├─ 1. HTTP GET /api/Config/app/{appId}?env={env}
+  ├─ 1. HTTPS GET /api/Config/app/{appId}?env={env}
   │     认证: Basic base64(appId:secret)
   │     → 加载配置到内存
   │
-  ├─ 2. WebSocket ws://server/ws
+  ├─ 2. WebSocket wss://server/ws
   │     认证: Basic base64(appId:secret)
   │     后台 goroutine
   │
@@ -131,7 +182,7 @@ Start()
 
 ## 环境要求
 
-- Go 1.21+
+- Go 1.25+（建议使用 `toolchain go1.25.11` 以包含安全补丁）
 - 运行中的 [AgileConfig](https://github.com/dotnetcore/AgileConfig) 服务端
 
 ## 许可证
