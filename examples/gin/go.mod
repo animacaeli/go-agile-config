@@ -5,7 +5,7 @@ go 1.25
 toolchain go1.25.11
 
 require (
-	github.com/animacaeli/go-agile-config v0.2.0
+	github.com/animacaeli/go-agile-config v0.3.0
 	github.com/gin-gonic/gin v1.10.1
 )
 

@@ -11,6 +11,7 @@
 - 线程安全的内存配置存储，支持变更检测
 - 默认使用 HTTPS/WSS，明文 HTTP 需要显式开启
 - HTTP 响应体和 WebSocket 消息都有大小上限
+- 服务发现 API，支持查询、注册、注销和心跳上报服务实例
 - 函数式选项，灵活配置
 - 除 [gorilla/websocket](https://github.com/gorilla/websocket) 外零外部依赖
 
@@ -159,6 +160,36 @@ defer client.Stop()
 mysqlHost, _ := client.GetByGroup("mysql", "db", "host")
 redisAddr := client.GetString("redis", "addr", "localhost:6379")
 all := client.GetAll() // map[appID]map[key]value
+```
+
+### 服务发现
+
+AgileConfig 也可以作为简单服务注册中心。可以通过以下 API 读取已经注册的服务实例：
+
+```go
+services, err := client.ListServices(context.Background())
+online, err := client.ListOnlineServices(context.Background())
+offline, err := client.ListOfflineServices(context.Background())
+```
+
+如果当前服务也要注册到 AgileConfig，并使用客户端心跳保活：
+
+```go
+port := 8080
+result, err := client.RegisterService(context.Background(), agileconfig.RegisterService{
+    ServiceID:     "order-service",
+    ServiceName:   "Order Service",
+    IP:            "10.0.0.8",
+    Port:          &port,
+    MetaData:      []string{"version=1.0.0"},
+    HeartbeatMode: agileconfig.HeartbeatModeClient,
+})
+if err != nil {
+    log.Fatal(err)
+}
+
+_, err = client.Heartbeat(context.Background(), result.UniqueID)
+_, err = client.UnregisterService(context.Background(), result.UniqueID)
 ```
 
 ## 工作原理

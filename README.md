@@ -11,6 +11,7 @@ A Go client SDK for [AgileConfig](https://github.com/dotnetcore/AgileConfig) —
 - Thread-safe in-memory config store with change detection
 - HTTPS/WSS by default, with explicit opt-in for local insecure HTTP
 - Bounded HTTP response and WebSocket message sizes
+- Service discovery APIs for listing, registering, unregistering, and heartbeating services
 - Functional options for flexible configuration
 - Zero external dependencies beyond [gorilla/websocket](https://github.com/gorilla/websocket)
 
@@ -159,6 +160,36 @@ defer client.Stop()
 mysqlHost, _ := client.GetByGroup("mysql", "db", "host")
 redisAddr := client.GetString("redis", "addr", "localhost:6379")
 all := client.GetAll() // map[appID]map[key]value
+```
+
+### Service Discovery
+
+AgileConfig can also work as a simple service registry. Use these APIs to read registered service instances or manage your own registration:
+
+```go
+services, err := client.ListServices(context.Background())
+online, err := client.ListOnlineServices(context.Background())
+offline, err := client.ListOfflineServices(context.Background())
+```
+
+To register a service instance and keep it alive with client-side heartbeat:
+
+```go
+port := 8080
+result, err := client.RegisterService(context.Background(), agileconfig.RegisterService{
+    ServiceID:     "order-service",
+    ServiceName:   "Order Service",
+    IP:            "10.0.0.8",
+    Port:          &port,
+    MetaData:      []string{"version=1.0.0"},
+    HeartbeatMode: agileconfig.HeartbeatModeClient,
+})
+if err != nil {
+    log.Fatal(err)
+}
+
+_, err = client.Heartbeat(context.Background(), result.UniqueID)
+_, err = client.UnregisterService(context.Background(), result.UniqueID)
 ```
 
 ## How It Works

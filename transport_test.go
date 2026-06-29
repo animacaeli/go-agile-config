@@ -212,3 +212,191 @@ func TestTransport_FetchConfigs_ServerErrorLimitsResponseBody(t *testing.T) {
 		t.Fatalf("expected limited error body, got error length %d", len(err.Error()))
 	}
 }
+
+func TestTransport_ListServices(t *testing.T) {
+	port := 8080
+	services := []ServiceInfo{
+		{
+			ServiceID:   "orders",
+			ServiceName: "orders-api",
+			IP:          "10.0.0.1",
+			Port:        &port,
+			MetaData:    []string{"version=1"},
+			Status:      ServiceStatusHealthy,
+		},
+	}
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/api/RegisterCenter/services" {
+			t.Errorf("unexpected path: %s", r.URL.Path)
+			http.NotFound(w, r)
+			return
+		}
+
+		auth := r.Header.Get("Authorization")
+		expected := "Basic " + base64.StdEncoding.EncodeToString([]byte("app1:secret1"))
+		if auth != expected {
+			t.Errorf("unexpected auth header: %s", auth)
+			http.Error(w, "unauthorized", http.StatusUnauthorized)
+			return
+		}
+
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(services)
+	}))
+	defer srv.Close()
+
+	tp := newTestTransport(srv.URL, "app1", "secret1", 5*time.Second)
+	result, err := tp.listServices(context.Background(), ServiceQueryStatusAll)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(result) != 1 {
+		t.Fatalf("expected 1 service, got %d", len(result))
+	}
+	if result[0].ServiceID != "orders" || result[0].Status != ServiceStatusHealthy {
+		t.Fatalf("unexpected service: %+v", result[0])
+	}
+	if result[0].Port == nil || *result[0].Port != port {
+		t.Fatalf("unexpected port: %+v", result[0].Port)
+	}
+}
+
+func TestTransport_ListServices_StatusPaths(t *testing.T) {
+	tests := []struct {
+		name   string
+		status ServiceQueryStatus
+		path   string
+	}{
+		{name: "online", status: ServiceQueryStatusOnline, path: "/api/RegisterCenter/services/online"},
+		{name: "offline", status: ServiceQueryStatusOffline, path: "/api/RegisterCenter/services/offline"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if r.URL.Path != tt.path {
+					t.Errorf("unexpected path: %s", r.URL.Path)
+					http.NotFound(w, r)
+					return
+				}
+
+				w.Header().Set("Content-Type", "application/json")
+				json.NewEncoder(w).Encode([]ServiceInfo{})
+			}))
+			defer srv.Close()
+
+			tp := newTestTransport(srv.URL, "app1", "secret1", 5*time.Second)
+			if _, err := tp.listServices(context.Background(), tt.status); err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+		})
+	}
+}
+
+func TestTransport_RegisterService(t *testing.T) {
+	port := 8080
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/api/RegisterCenter" {
+			t.Errorf("unexpected path: %s", r.URL.Path)
+			http.NotFound(w, r)
+			return
+		}
+		if r.Method != http.MethodPost {
+			t.Errorf("unexpected method: %s", r.Method)
+		}
+		if contentType := r.Header.Get("Content-Type"); contentType != "application/json" {
+			t.Errorf("unexpected content type: %s", contentType)
+		}
+
+		var req RegisterService
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			t.Fatalf("decode request: %v", err)
+		}
+		if req.ServiceID != "orders" || req.Port == nil || *req.Port != port {
+			t.Fatalf("unexpected request: %+v", req)
+		}
+
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(RegisterResult{UniqueID: "service-unique-id"})
+	}))
+	defer srv.Close()
+
+	tp := newTestTransport(srv.URL, "app1", "secret1", 5*time.Second)
+	result, err := tp.registerService(context.Background(), RegisterService{
+		ServiceID:     "orders",
+		ServiceName:   "orders-api",
+		IP:            "10.0.0.1",
+		Port:          &port,
+		MetaData:      []string{"version=1"},
+		HeartbeatMode: HeartbeatModeClient,
+	})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if result.UniqueID != "service-unique-id" {
+		t.Fatalf("unexpected unique id: %s", result.UniqueID)
+	}
+}
+
+func TestTransport_UnregisterService_EscapesUniqueID(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.EscapedPath() != "/api/RegisterCenter/service%2Fone" {
+			t.Errorf("unexpected path: %s", r.URL.EscapedPath())
+			http.NotFound(w, r)
+			return
+		}
+		if r.Method != http.MethodDelete {
+			t.Errorf("unexpected method: %s", r.Method)
+		}
+
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(RegisterResult{UniqueID: "service/one"})
+	}))
+	defer srv.Close()
+
+	tp := newTestTransport(srv.URL, "app1", "secret1", 5*time.Second)
+	result, err := tp.unregisterService(context.Background(), "service/one")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if result.UniqueID != "service/one" {
+		t.Fatalf("unexpected unique id: %s", result.UniqueID)
+	}
+}
+
+func TestTransport_Heartbeat(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/api/RegisterCenter/heartbeat" {
+			t.Errorf("unexpected path: %s", r.URL.Path)
+			http.NotFound(w, r)
+			return
+		}
+
+		var req heartbeatRequest
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			t.Fatalf("decode request: %v", err)
+		}
+		if req.UniqueID != "service-unique-id" {
+			t.Fatalf("unexpected unique id: %s", req.UniqueID)
+		}
+
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(HeartbeatResult{
+			Module: "RegisterCenter",
+			Action: "ping",
+			Data:   "services-md5",
+		})
+	}))
+	defer srv.Close()
+
+	tp := newTestTransport(srv.URL, "app1", "secret1", 5*time.Second)
+	result, err := tp.heartbeat(context.Background(), "service-unique-id")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if result.Action != "ping" || result.Data != "services-md5" {
+		t.Fatalf("unexpected heartbeat result: %+v", result)
+	}
+}
