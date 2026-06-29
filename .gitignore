@@ -2,3 +2,5 @@
 venv
 docs
 .DS_Store
+go.work
+go.work.sum
