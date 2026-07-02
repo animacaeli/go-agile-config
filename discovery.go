@@ -45,6 +45,7 @@ type RegisterService struct {
 	IP            string        `json:"Ip"`
 	Port          *int          `json:"Port"`
 	MetaData      []string      `json:"MetaData"`
+	Env           string        `json:"Env,omitempty"`
 	CheckURL      string        `json:"CheckUrl,omitempty"`
 	AlarmURL      string        `json:"AlarmUrl,omitempty"`
 	HeartbeatMode HeartbeatMode `json:"HeartBeatMode,omitempty"`

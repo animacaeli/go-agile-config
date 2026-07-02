@@ -32,6 +32,7 @@ type transport struct {
 	serverURL         string
 	appID             string
 	secret            string
+	env               string
 	client            *http.Client
 	maxResponseBody   int64
 	allowInsecureHTTP bool
@@ -42,6 +43,7 @@ func newTransport(serverURL, appID, secret string, opts options) *transport {
 		serverURL:         normalizeServerURL(serverURL),
 		appID:             appID,
 		secret:            secret,
+		env:               opts.env,
 		client:            newHTTPClient(opts),
 		maxResponseBody:   opts.maxResponseBody,
 		allowInsecureHTTP: opts.allowInsecureHTTP,
@@ -76,6 +78,7 @@ func (t *transport) listServices(ctx context.Context, status ServiceQueryStatus)
 	case ServiceQueryStatusOffline:
 		u += "/offline"
 	}
+	u = appendEnvQuery(u, t.env)
 
 	var services []ServiceInfo
 	if _, err := t.doJSON(ctx, http.MethodGet, u, nil, &services); err != nil {
@@ -86,6 +89,9 @@ func (t *transport) listServices(ctx context.Context, status ServiceQueryStatus)
 
 func (t *transport) registerService(ctx context.Context, service RegisterService) (RegisterResult, error) {
 	u := t.serverURL + "/api/RegisterCenter"
+	if service.Env == "" {
+		service.Env = t.env
+	}
 
 	var result RegisterResult
 	if _, err := t.doJSON(ctx, http.MethodPost, u, service, &result); err != nil {
@@ -191,6 +197,13 @@ func newHTTPClient(opts options) *http.Client {
 
 func normalizeServerURL(serverURL string) string {
 	return strings.TrimRight(serverURL, "/")
+}
+
+func appendEnvQuery(requestURL, env string) string {
+	if env == "" {
+		return requestURL
+	}
+	return requestURL + "?env=" + url.QueryEscape(env)
 }
 
 func validateServerURL(serverURL string, allowInsecureHTTP bool) error {

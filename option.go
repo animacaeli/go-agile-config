@@ -34,7 +34,7 @@ func defaultOptions() options {
 	}
 }
 
-// WithEnv sets the environment name for config requests.
+// WithEnv sets the environment name for config, WebSocket, and service discovery requests.
 func WithEnv(env string) Option {
 	return func(o *options) {
 		o.env = env

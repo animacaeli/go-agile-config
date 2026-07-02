@@ -232,6 +232,9 @@ func TestTransport_ListServices(t *testing.T) {
 			http.NotFound(w, r)
 			return
 		}
+		if r.URL.Query().Has("env") {
+			t.Errorf("unexpected env query: %s", r.URL.RawQuery)
+		}
 
 		auth := r.Header.Get("Authorization")
 		expected := "Basic " + base64.StdEncoding.EncodeToString([]byte("app1:secret1"))
@@ -262,6 +265,34 @@ func TestTransport_ListServices(t *testing.T) {
 	}
 }
 
+func TestTransport_ListServices_WithEnv(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/api/RegisterCenter/services" {
+			t.Errorf("unexpected path: %s", r.URL.Path)
+			http.NotFound(w, r)
+			return
+		}
+		if got := r.URL.Query().Get("env"); got != "DEV" {
+			t.Errorf("expected env=DEV, got %s", got)
+		}
+
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode([]ServiceInfo{
+			{ServiceID: "orders", ServiceName: "orders-api", IP: "10.0.0.1", Status: ServiceStatusHealthy},
+		})
+	}))
+	defer srv.Close()
+
+	tp := newTestTransport(srv.URL, "app1", "secret1", 5*time.Second, WithEnv("DEV"))
+	result, err := tp.listServices(context.Background(), ServiceQueryStatusAll)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(result) != 1 || result[0].ServiceID != "orders" {
+		t.Fatalf("unexpected services: %+v", result)
+	}
+}
+
 func TestTransport_ListServices_StatusPaths(t *testing.T) {
 	tests := []struct {
 		name   string
@@ -280,13 +311,16 @@ func TestTransport_ListServices_StatusPaths(t *testing.T) {
 					http.NotFound(w, r)
 					return
 				}
+				if got := r.URL.Query().Get("env"); got != "PROD" {
+					t.Errorf("expected env=PROD, got %s", got)
+				}
 
 				w.Header().Set("Content-Type", "application/json")
 				json.NewEncoder(w).Encode([]ServiceInfo{})
 			}))
 			defer srv.Close()
 
-			tp := newTestTransport(srv.URL, "app1", "secret1", 5*time.Second)
+			tp := newTestTransport(srv.URL, "app1", "secret1", 5*time.Second, WithEnv("PROD"))
 			if _, err := tp.listServices(context.Background(), tt.status); err != nil {
 				t.Fatalf("unexpected error: %v", err)
 			}
@@ -317,13 +351,16 @@ func TestTransport_RegisterService(t *testing.T) {
 		if req.ServiceID != "orders" || req.Port == nil || *req.Port != port {
 			t.Fatalf("unexpected request: %+v", req)
 		}
+		if req.Env != "DEV" {
+			t.Fatalf("expected env=DEV, got %s", req.Env)
+		}
 
 		w.Header().Set("Content-Type", "application/json")
 		json.NewEncoder(w).Encode(RegisterResult{UniqueID: "service-unique-id"})
 	}))
 	defer srv.Close()
 
-	tp := newTestTransport(srv.URL, "app1", "secret1", 5*time.Second)
+	tp := newTestTransport(srv.URL, "app1", "secret1", 5*time.Second, WithEnv("DEV"))
 	result, err := tp.registerService(context.Background(), RegisterService{
 		ServiceID:     "orders",
 		ServiceName:   "orders-api",
@@ -337,6 +374,59 @@ func TestTransport_RegisterService(t *testing.T) {
 	}
 	if result.UniqueID != "service-unique-id" {
 		t.Fatalf("unexpected unique id: %s", result.UniqueID)
+	}
+}
+
+func TestTransport_RegisterService_ExplicitEnvOverridesClientEnv(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var req RegisterService
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			t.Fatalf("decode request: %v", err)
+		}
+		if req.Env != "QA" {
+			t.Fatalf("expected env=QA, got %s", req.Env)
+		}
+
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(RegisterResult{UniqueID: "service-unique-id"})
+	}))
+	defer srv.Close()
+
+	tp := newTestTransport(srv.URL, "app1", "secret1", 5*time.Second, WithEnv("DEV"))
+	_, err := tp.registerService(context.Background(), RegisterService{
+		ServiceID:   "orders",
+		ServiceName: "orders-api",
+		IP:          "10.0.0.1",
+		Env:         "QA",
+	})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+}
+
+func TestTransport_RegisterService_WithoutEnvOmitsEnv(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var payload map[string]any
+		if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
+			t.Fatalf("decode request: %v", err)
+		}
+		if _, ok := payload["Env"]; ok {
+			t.Fatalf("unexpected Env field in request: %+v", payload)
+		}
+
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(RegisterResult{UniqueID: "service-unique-id"})
+	}))
+	defer srv.Close()
+
+	tp := newTestTransport(srv.URL, "app1", "secret1", 5*time.Second)
+	_, err := tp.registerService(context.Background(), RegisterService{
+		ServiceID:   "orders",
+		ServiceName: "orders-api",
+		IP:          "10.0.0.1",
+	})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
 	}
 }
 
